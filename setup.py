@@ -21,7 +21,11 @@ setup_args = dict(
 
 install_requires = [
     'feedparser>=6.0.8',
-    'requests>=2.22.0'
+    'requests>=2.22.0',
+    'httpx>=0.26.0',
+    'aiofiles>=23.2.1',
+    'aiolimiter>=1.1.0',
+    'humanize>=4.9.0'
 ]
 
 if __name__ == '__main__':

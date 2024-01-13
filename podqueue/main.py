@@ -1,25 +1,48 @@
 #!/bin/env python3
-
-# Builtins
-import time
-import re
-import os
-import json
-from io import IOBase
-import xml.etree.ElementTree as ET
-import logging
-
-# Async
-import asyncio
-import httpx
-import aiofiles
-
 # PIP
 import argparse
+# Async
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import time
+import xml.etree.ElementTree as ET
 from configparser import ConfigParser
+from io import IOBase
+from pathlib import Path
+# Builtins
+from typing import Optional
+
+import aiofiles
+import aiolimiter
 import feedparser
+import httpx
+
 
 # ----- ----- ----- ----- -----
+
+class NoOpRateLimiter():
+
+  async def __aenter__(self):
+    return
+
+  async def __aexit__(self, exc_type, exc, tb):
+    return
+
+class Countdown:
+  def __init__(self, limit: int):
+    self.value = limit
+    self.lock = asyncio.Lock()
+
+  async def decrement(self):
+    async with self.lock:
+      if self.value <= 0:
+        raise ValueError("Reached limit")
+      self.value -= 1
+
 
 class podqueue():
 
@@ -38,13 +61,23 @@ class podqueue():
     self.feeds = []
     self.FEED_FIELDS = ['title', 'link', 'description', 'published', 'image', 'categories',]
     self.EPISODE_FIELDS = ['title', 'link', 'description', 'published_parsed', 'links',]
-    self.http_session = None
+    self.http_session: Optional[httpx.AsyncClient] = None
+    self.rate_limit = None
+    self.downloads_per_feed = None
 
     # If a config file exists, ingest it
     self.check_config()
 
     # Overwrite any config file defaults with CLI params
     self.cli_args()
+
+    if not self.rate_limit:
+      self.rate_limiter = NoOpRateLimiter()
+    else:
+      self.rate_limiter = aiolimiter.AsyncLimiter(self.rate_limit, 60)
+
+    if self.downloads_per_feed is None or self.downloads_per_feed < 1:
+        self.downloads_per_feed = float("inf")
 
     self.config_logging()
 
@@ -122,6 +155,8 @@ class podqueue():
       help='Prints additional debug information. If excluded, only errors are printed (for automation).')
     parser.add_argument('-l', '--log_file', dest='log_file',
       help='Specify a path to the log file. Defaults to ./podqueue.log')
+    parser.add_argument('-r', '--rate_limit', dest='rate_limit', type=int, help="Rate limit in network 'actions' per minute. Defaults to 0 (no limit).", default=0)
+    parser.add_argument('-n', '--downloads-per-feed', dest='downloads_per_feed', type=int, help="Number of episodes to download per feed. Defaults to 0 (all).", default=0)
     
     # Save the CLI args to class vars - self.XXX
     # vars() converts into a native dict
@@ -199,9 +234,11 @@ class podqueue():
     if feed_metadata.get('image', None):
       await self.write_feed_image(feed_metadata['image'], directory)
 
+    countdown = Countdown(self.downloads_per_feed)
+
     # Then, process the episodes each and write to disk
     for episode in content.entries:
-      await self.process_feed_episode(episode, directory)
+      await self.process_feed_episode(episode, directory, countdown)
 
 
   def create_feed_directories(self, title: str) -> str:
@@ -275,7 +312,8 @@ class podqueue():
 
   async def process_feed_episode(self, 
               episode: feedparser.util.FeedParserDict, 
-              directory: str) -> None:
+              directory: str,
+              countdown: Countdown) -> None:
     episode_metadata = {}
     for field in self.EPISODE_FIELDS:
       episode_metadata[field] = episode.get(field, None)
@@ -312,6 +350,12 @@ class podqueue():
       logging.info(f'\t\tEpisode already saved, skipping: {episode_title}')
       return None
 
+    try:
+      await countdown.decrement()
+    except ValueError:
+      logging.info(f'\t\tReached download limit for feed, skipping: {episode_title}')
+      return None
+
     episode_metadata = await self.write_episode_metadata(episode_title, 
       episode_metadata, episode_meta_filename
     )
@@ -337,9 +381,9 @@ class podqueue():
       # Remove the old complicated links{}
       episode_metadata.pop('links', None)
 
-    # Write metadata to disk
-    async with aiofiles.open(episode_meta_filename, 'w') as ep_meta_f:
-        await ep_meta_f.write(json.dumps(episode_metadata))
+    async with aiofiles.tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_ep_meta_f:
+        await temp_ep_meta_f.write(json.dumps(episode_metadata))
+    shutil.move(temp_ep_meta_f.name, episode_meta_filename)
 
     logging.info(f'\t\tAdded episode metadata to disk: {episode_title}')
     return episode_metadata
@@ -347,19 +391,45 @@ class podqueue():
 
   async def write_episode_audio(self, 
               episode_title: str, 
-              audio_url: dict, 
+              audio_url: str,
               episode_audio_filename: str) -> None:
+    async with aiofiles.tempfile.NamedTemporaryFile(mode='wb', delete=False) as temp_audio_f:
+      temp_audio_path = Path(temp_audio_f.name)
+      process = await asyncio.create_subprocess_exec('aria2c',
+                                         '--max-connection-per-server=4',
+                                         '--show-console-readout=false',
+                                         '--summary-interval=10',
+                                         '--allow-overwrite=true',
+                                         '--auto-file-renaming=false',
+                                         '--max-download-limit=2M',
+                                         f'--dir={temp_audio_path.parent}',
+                                         f'--out={temp_audio_path.name}',
+                                         audio_url)
+      rc = await process.wait()
+      if rc != 0:
+        logging.error(f'\t\tError downloading episode audio: {episode_title} from {audio_url}')
+        os.unlink(temp_audio_f.name)
+        return None
+      # Move the file to the final location
+      shutil.move(temp_audio_f.name, episode_audio_filename)
 
-    async with self.http_session.stream('GET', 
-      audio_url,
-      follow_redirects=True
-      ) as response:
-
-      response.raise_for_status()
-      
-      async with aiofiles.open(episode_audio_filename, 'wb') as audio_f:
-        async for chunk in response.aiter_bytes(chunk_size=1024*8):
-          await audio_f.write(chunk)
+    # async with self.http_session.stream('GET',
+    #   audio_url,
+    #   follow_redirects=True
+    #   ) as response:
+    #
+    #     response.raise_for_status()
+    #
+    #     async with aiofiles.tempfile.NamedTemporaryFile(mode='wb', delete=False) as temp_audio_f:
+    #       last_report_time = time.time()
+    #       async for chunk in response.aiter_bytes(chunk_size=1024*8):
+    #         async with self.rate_limiter:
+    #           await temp_audio_f.write(chunk)
+    #           if (time.time() - last_report_time) > 60:
+    #             logging.info(f'\t\t\t{episode_title}: {humanize.filesize.naturalsize(await temp_audio_f.tell(), binary=True)}')
+    #             last_report_time = time.time()
+    #
+    #     shutil.move(temp_audio_f.name, episode_audio_filename)
 
     logging.info(f'\t\tAdded episode audio to disk: {episode_title}')
 

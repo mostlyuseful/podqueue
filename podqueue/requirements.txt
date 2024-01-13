@@ -3,3 +3,6 @@ configparser
 aiofiles
 asyncio
 httpx
+aiolimiter
+requests
+humanize
